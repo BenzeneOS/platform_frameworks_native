@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +50,41 @@ bool startTrackingProcessCpuTimes(pid_t pid);
 bool startAggregatingTaskCpuTimes(pid_t pid, uint16_t aggregationKey);
 std::optional<std::unordered_map<uint16_t, std::vector<std::vector<uint64_t>>>>
 getAggregatedTaskCpuFreqTimes(pid_t pid, const std::vector<uint16_t> &aggregationKeys);
+
+struct uid_cpu_bucket_t {
+    uint32_t uid;
+    uint64_t start_elapsed_realtime_ms;
+    uint64_t runtime_ns;
+};
+
+/** Dynamically attaches Observatory's scheduler accounting. No program runs while detached. */
+bool startObservatoryCpuTracking();
+void stopObservatoryCpuTracking();
+bool isObservatoryCpuTrackingActive();
+
+/**
+ * Blocks without a timer until pressure. Stops are negative and distinguishable. -ENOENT for no
+ * session, -ECANCELED for taking the stop token, -ESTALE for a session retired by another waiter.
+ */
+int waitForObservatoryCpuPressure();
+
+/** Identifies the current tracking session. Changes on every start and every stop. */
+uint64_t observatoryCpuSessionGeneration();
+
+/**
+ * Returns and removes completed 500 ms buckets, oldest first.
+ *
+ * <p>[safeWatermarkMs], when given, receives the oldest bucket start a later drain can still
+ * produce, or zero when that is unknown. A caller retiring state alongside these buckets must use
+ * it rather than the newest bucket returned, because a scan cut short by map churn leaves behind
+ * keys older than anything it handed over.
+ *
+ * <p>[expectedGeneration], when not zero, fails the drain unless the session is still the one that
+ * generation names. A caller that decided to drain before it got here would otherwise empty a
+ * session it never meant to touch, and read it with state belonging to the session it did.
+ */
+std::optional<std::vector<uid_cpu_bucket_t>> drainObservatoryCpuBuckets(
+        size_t maxRecords, uint64_t* safeWatermarkMs = nullptr, uint64_t expectedGeneration = 0);
 
 } // namespace bpf
 } // namespace android

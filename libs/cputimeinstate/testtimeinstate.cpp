@@ -27,6 +27,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <thread>
+
 #include <android-base/properties.h>
 #include <android-base/unique_fd.h>
 #include <bpf/BpfMap.h>
@@ -705,6 +711,96 @@ TEST_F(TimeInStateTest, SdkSandboxUid) {
     ASSERT_EQ(allConcurrentTimes->find(sandboxUid), allConcurrentTimes->end());
 
     ASSERT_TRUE(clearUidTimes(appUid));
+}
+
+// Detached, so a stranded waiter fails an assertion instead of blocking a destructor forever.
+struct ObservatoryWaiterGroup {
+    std::mutex lock;
+    std::condition_variable progress;
+    int entered = 0;
+    int finished = 0;
+    std::vector<int> results;
+};
+
+static void spawnObservatoryWaiter(std::shared_ptr<ObservatoryWaiterGroup> group) {
+    std::thread([group] {
+        {
+            std::lock_guard<std::mutex> guard(group->lock);
+            group->entered++;
+        }
+        group->progress.notify_all();
+        const int result = waitForObservatoryCpuPressure();
+        {
+            std::lock_guard<std::mutex> guard(group->lock);
+            group->results.push_back(result);
+            group->finished++;
+        }
+        group->progress.notify_all();
+    }).detach();
+}
+
+static bool awaitObservatoryWaiters(const std::shared_ptr<ObservatoryWaiterGroup> &group,
+                                    int entered, int finished) {
+    std::unique_lock<std::mutex> guard(group->lock);
+    return group->progress.wait_for(guard, std::chrono::seconds(10), [&] {
+        return group->entered >= entered && group->finished >= finished;
+    });
+}
+
+TEST(TimeInStateTest, ObservatoryStopReleasesEveryWaiterInOneSession) {
+    if (!startObservatoryCpuTracking()) GTEST_SKIP() << "Observatory tracking unavailable";
+    stopObservatoryCpuTracking();
+
+    // One stop frees only the waiter holding the ring-buffer lock, so the other must be freed by
+    // the retired session. A waiter that arrived after the stop proved nothing, so retry.
+    for (int attempt = 0; attempt < 20; attempt++) {
+        ASSERT_TRUE(startObservatoryCpuTracking());
+        auto group = std::make_shared<ObservatoryWaiterGroup>();
+        spawnObservatoryWaiter(group);
+        spawnObservatoryWaiter(group);
+        ASSERT_TRUE(awaitObservatoryWaiters(group, 2, 0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        stopObservatoryCpuTracking();
+
+        ASSERT_TRUE(awaitObservatoryWaiters(group, 2, 2))
+                << "a waiter never returned from stop on attempt " << attempt;
+        std::lock_guard<std::mutex> guard(group->lock);
+        const auto &results = group->results;
+        for (int result : results) EXPECT_LT(result, 0);
+        if (std::count(results.begin(), results.end(), -ECANCELED) == 1 &&
+            std::count(results.begin(), results.end(), -ESTALE) == 1) {
+            return;
+        }
+    }
+    FAIL() << "no attempt got both waiters into one session";
+}
+
+TEST(TimeInStateTest, ObservatoryRapidStopRestartDoesNotStrandWaiters) {
+    if (!startObservatoryCpuTracking()) GTEST_SKIP() << "Observatory tracking unavailable";
+    stopObservatoryCpuTracking();
+
+    // Waiters are left running across the restarts, since a cancellation fd shared between
+    // sessions lets one round's waiter absorb another round's wakeup and strand the rest.
+    auto group = std::make_shared<ObservatoryWaiterGroup>();
+    constexpr int kRounds = 8;
+    for (int round = 0; round < kRounds; round++) {
+        ASSERT_TRUE(startObservatoryCpuTracking());
+        spawnObservatoryWaiter(group);
+        spawnObservatoryWaiter(group);
+        ASSERT_TRUE(awaitObservatoryWaiters(group, 2 * (round + 1), 0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stopObservatoryCpuTracking();
+    }
+
+    ASSERT_TRUE(awaitObservatoryWaiters(group, 2 * kRounds, 2 * kRounds));
+    std::lock_guard<std::mutex> guard(group->lock);
+    for (int result : group->results) EXPECT_LT(result, 0);
+}
+
+TEST(TimeInStateTest, ObservatoryWaitWithoutSessionFails) {
+    stopObservatoryCpuTracking();
+    ASSERT_EQ(waitForObservatoryCpuPressure(), -ENOENT);
 }
 
 } // namespace bpf

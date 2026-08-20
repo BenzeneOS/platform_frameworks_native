@@ -17,12 +17,20 @@
 #define LOG_TAG "libtimeinstate"
 
 #include "cputimeinstate.h"
+#include <bpf_observatorycpu.h>
 #include <bpf_timeinstate.h>
 
+#include <algorithm>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <string.h>
+#include <sys/eventfd.h>
 #include <sys/sysinfo.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <mutex>
 #include <numeric>
@@ -62,6 +70,16 @@ static unique_fd gTisMapFd;
 static unique_fd gConcurrentMapFd;
 static unique_fd gUidLastUpdateMapFd;
 static unique_fd gPidTisMapFd;
+
+static std::mutex gObservatoryMutex;
+static std::mutex gObservatoryPressureWaitMutex;
+static unique_fd gObservatoryProgramLinkFd;
+static unique_fd gObservatoryBucketMapFd;
+static unique_fd gObservatoryLastMonotonicMapFd;
+static unique_fd gObservatoryTotalNewEntriesMapFd;
+static unique_fd gObservatoryNextPressureAtMapFd;
+static unique_fd gObservatoryDroppedRuntimeMapFd;
+static uint64_t gObservatoryReportedDroppedRuntimeNs = 0;
 
 static std::optional<std::vector<uint32_t>> readNumbersFromFile(const std::string &path) {
     std::string data;
@@ -683,6 +701,343 @@ getAggregatedTaskCpuFreqTimes(pid_t tgid, const std::vector<uint16_t> &aggregati
         }
     }
     return map;
+}
+
+static bool initObservatoryMapsLocked() {
+    if (gObservatoryBucketMapFd < 0) {
+        gObservatoryBucketMapFd.reset(
+                mapRetrieveRW(BPF_OBSERVATORY_CPU_PATH
+                              "map_observatoryCpu_cpu_bucket_map"));
+    }
+    if (gObservatoryLastMonotonicMapFd < 0) {
+        gObservatoryLastMonotonicMapFd.reset(
+                mapRetrieveWO(BPF_OBSERVATORY_CPU_PATH
+                              "map_observatoryCpu_last_monotonic_ns_map"));
+    }
+    if (gObservatoryTotalNewEntriesMapFd < 0) {
+        gObservatoryTotalNewEntriesMapFd.reset(
+                mapRetrieveRW(BPF_OBSERVATORY_CPU_PATH
+                              "map_observatoryCpu_total_new_entries_map"));
+    }
+    if (gObservatoryNextPressureAtMapFd < 0) {
+        gObservatoryNextPressureAtMapFd.reset(
+                mapRetrieveRW(BPF_OBSERVATORY_CPU_PATH
+                              "map_observatoryCpu_next_pressure_at_map"));
+    }
+    if (gObservatoryDroppedRuntimeMapFd < 0) {
+        gObservatoryDroppedRuntimeMapFd.reset(
+                mapRetrieveRW(BPF_OBSERVATORY_CPU_PATH
+                              "map_observatoryCpu_dropped_runtime_ns_map"));
+    }
+    return gObservatoryBucketMapFd >= 0 && gObservatoryLastMonotonicMapFd >= 0 &&
+            gObservatoryTotalNewEntriesMapFd >= 0 && gObservatoryNextPressureAtMapFd >= 0;
+}
+
+static bool clearObservatoryBucketsLocked() {
+    observatory_cpu_bucket_key_t key;
+    while (getFirstMapKey(gObservatoryBucketMapFd, &key) == 0) {
+        if (deleteMapEntry(gObservatoryBucketMapFd, &key) != 0 && errno != ENOENT) {
+            ALOGE("Failed to clear Observatory CPU bucket map: %s", strerror(errno));
+            return false;
+        }
+    }
+    return errno == ENOENT;
+}
+
+// One cancel fd per session. A shared fd lets a restarted waiter consume a token meant for a
+// stale one, so the two strand each other. A waiter holding a retired fd simply fails instead.
+static unique_fd gObservatoryPressureCancelFd;
+static uint64_t gObservatorySessionGeneration = 0;
+
+static int startObservatoryPressureGenerationLocked() {
+    gObservatoryPressureCancelFd.reset(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (gObservatoryPressureCancelFd < 0) return -errno;
+    ++gObservatorySessionGeneration;
+    return 0;
+}
+
+bool startObservatoryCpuTracking() {
+    std::lock_guard<std::mutex> guard(gObservatoryMutex);
+    if (gObservatoryProgramLinkFd >= 0) return true;
+    if (!initObservatoryMapsLocked() || !clearObservatoryBucketsLocked()) return false;
+
+    const uint32_t zero = 0;
+    const std::vector<uint64_t> perCpuZeros(get_nprocs_conf(), 0);
+    if (writeToMapEntry(gObservatoryLastMonotonicMapFd, &zero, perCpuZeros.data(), BPF_ANY) != 0) {
+        ALOGE("Failed to initialize Observatory CPU accounting state: %s", strerror(errno));
+        return false;
+    }
+    const uint64_t noEntries = 0;
+    const uint64_t firstPressure = OBSERVATORY_CPU_PRESSURE_BUCKETS;
+    if (writeToMapEntry(gObservatoryTotalNewEntriesMapFd, &zero, &noEntries, BPF_ANY) != 0 ||
+        writeToMapEntry(gObservatoryNextPressureAtMapFd, &zero, &firstPressure, BPF_ANY) != 0) {
+        ALOGE("Failed to initialize Observatory CPU pressure state: %s", strerror(errno));
+        return false;
+    }
+    if (gObservatoryDroppedRuntimeMapFd >= 0 &&
+        findMapEntry(gObservatoryDroppedRuntimeMapFd, &zero,
+                     &gObservatoryReportedDroppedRuntimeNs) != 0) {
+        gObservatoryReportedDroppedRuntimeNs = 0;
+    }
+
+    unique_fd programFd(retrieveProgram(
+            BPF_OBSERVATORY_CPU_PATH
+            "prog_observatoryCpu_raw_tracepoint_sched_switch"));
+    if (programFd < 0) {
+        ALOGE("Failed to retrieve Observatory CPU accounting program: %s", strerror(errno));
+        return false;
+    }
+    // A raw tracepoint link does not require tracefs event metadata. Some production kernels keep
+    // that metadata hidden under lockdown even though raw sched_switch attachment is available.
+    gObservatoryProgramLinkFd.reset(bpf_attach_raw_tracepoint(programFd, "sched_switch"));
+    if (gObservatoryProgramLinkFd < 0) {
+        ALOGE("Failed to attach Observatory CPU accounting program: %s", strerror(errno));
+        return false;
+    }
+    // Armed only once the program is attached. Arming earlier leaves a failed start advertising a
+    // session that no stop will ever cancel.
+    const int cancelError = startObservatoryPressureGenerationLocked();
+    if (cancelError != 0) {
+        ALOGE("Failed to arm Observatory CPU pressure cancellation: %s", strerror(-cancelError));
+        gObservatoryProgramLinkFd.reset();
+        return false;
+    }
+    return true;
+}
+
+void stopObservatoryCpuTracking() {
+    std::lock_guard<std::mutex> guard(gObservatoryMutex);
+    // Closing the raw-tracepoint link detaches the program immediately.
+    gObservatoryProgramLinkFd.reset();
+    if (gObservatoryPressureCancelFd >= 0) {
+        const uint64_t token = 1;
+        if (TEMP_FAILURE_RETRY(write(gObservatoryPressureCancelFd.get(), &token, sizeof(token))) <
+            0) {
+            ALOGW("Failed to interrupt Observatory CPU pressure waiter: %s", strerror(errno));
+        }
+        // Retired with the session, so a waiter that wakes later cannot serve the next one.
+        gObservatoryPressureCancelFd.reset();
+    }
+    // Bumped on stop as well as start. Two waiters can capture one generation, and without this
+    // the one that did not consume the token would pass its recheck and park on a retired fd.
+    ++gObservatorySessionGeneration;
+}
+
+bool isObservatoryCpuTrackingActive() {
+    std::lock_guard<std::mutex> guard(gObservatoryMutex);
+    return gObservatoryProgramLinkFd >= 0;
+}
+
+struct ObservatoryPressureWaitContext {
+    bool received = false;
+};
+
+static int handleObservatoryPressureEvent(void* context, void* data, size_t size) {
+    if (size != sizeof(uint64_t)) {
+        ALOGE("Ignoring malformed Observatory CPU pressure event of size %zu", size);
+        return 0;
+    }
+    (void)data;
+    static_cast<ObservatoryPressureWaitContext*>(context)->received = true;
+    return 0;
+}
+
+int waitForObservatoryCpuPressure() {
+    // libbpf's ring-buffer manager is not safe for concurrent pollers. BatteryStats owns one
+    // lifetime thread, but serialize here as a defensive API boundary as well.
+    unique_fd cancelFd;
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> trackingGuard(gObservatoryMutex);
+        if (gObservatoryPressureCancelFd < 0) return -ENOENT;
+        cancelFd.reset(fcntl(gObservatoryPressureCancelFd.get(), F_DUPFD_CLOEXEC, 0));
+        if (cancelFd < 0) return -errno;
+        generation = gObservatorySessionGeneration;
+    }
+    std::lock_guard<std::mutex> guard(gObservatoryPressureWaitMutex);
+    {
+        // Rechecked after the wait lock, since a stale waiter may have held it across a restart.
+        std::lock_guard<std::mutex> trackingGuard(gObservatoryMutex);
+        if (generation != gObservatorySessionGeneration) return -ESTALE;
+    }
+    unique_fd pressureMapFd(mapRetrieveRW(
+            BPF_OBSERVATORY_CPU_PATH "map_observatoryCpu_pressure_events"));
+    if (pressureMapFd < 0) {
+        const int error = errno;
+        ALOGE("Failed to retrieve Observatory CPU pressure ring buffer: %s", strerror(error));
+        return -error;
+    }
+
+    ObservatoryPressureWaitContext context;
+    auto* ringBuffer = static_cast<struct ring_buffer*>(
+            bpf_new_ringbuf(pressureMapFd, handleObservatoryPressureEvent, &context));
+    if (ringBuffer == nullptr) {
+        const int error = errno != 0 ? errno : ENOMEM;
+        ALOGE("Failed to open Observatory CPU pressure ring buffer: %s", strerror(error));
+        return -error;
+    }
+
+    int result = 0;
+    while (!context.received) {
+        // Waiting on the map fd directly lets the cancel fd share one poll.
+        struct pollfd waitSet[2] = {
+                {.fd = cancelFd.get(), .events = POLLIN, .revents = 0},
+                {.fd = pressureMapFd.get(), .events = POLLIN, .revents = 0},
+        };
+        if (TEMP_FAILURE_RETRY(poll(waitSet, 2, -1)) < 0) {
+            result = -errno;
+            ALOGE("Failed while waiting for Observatory CPU bucket pressure: %s",
+                  strerror(-result));
+            break;
+        }
+        if (waitSet[0].revents != 0) {
+            uint64_t token;
+            if (TEMP_FAILURE_RETRY(read(cancelFd.get(), &token, sizeof(token))) < 0 &&
+                errno != EAGAIN) {
+                ALOGW("Failed to consume Observatory pressure stop request: %s", strerror(errno));
+            }
+            result = -ECANCELED;
+            break;
+        }
+        result = bpf_poll_ringbuf(ringBuffer, 0);
+        if (result == -EINTR) continue;
+        if (result < 0) {
+            ALOGE("Failed while draining Observatory CPU bucket pressure events: %s",
+                  strerror(-result));
+            break;
+        }
+    }
+    bpf_free_ringbuf(ringBuffer);
+    return context.received ? 0 : result;
+}
+
+static bool rearmObservatoryCpuPressureLocked(uint64_t totalNewEntries,
+                                              uint64_t estimatedResidentEntries) {
+    const uint32_t zero = 0;
+    // A floor keeps a saturated map from firing a callback per insertion.
+    static constexpr uint64_t kMinInsertionsBetweenPressureEvents = 1024;
+    const uint64_t insertionsUntilPressure = std::max(
+            kMinInsertionsBetweenPressureEvents,
+            estimatedResidentEntries >= OBSERVATORY_CPU_PRESSURE_BUCKETS
+                    ? uint64_t{0}
+                    : OBSERVATORY_CPU_PRESSURE_BUCKETS - estimatedResidentEntries);
+    const uint64_t nextPressure = totalNewEntries + insertionsUntilPressure;
+    if (writeToMapEntry(gObservatoryNextPressureAtMapFd, &zero, &nextPressure, BPF_ANY) != 0) {
+        ALOGE("Failed to re-arm Observatory CPU bucket pressure: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static constexpr size_t kObservatoryMaxScanSteps = OBSERVATORY_CPU_MAX_BUCKETS * 2;
+
+uint64_t observatoryCpuSessionGeneration() {
+    std::lock_guard<std::mutex> guard(gObservatoryMutex);
+    return gObservatorySessionGeneration;
+}
+
+std::optional<std::vector<uid_cpu_bucket_t>> drainObservatoryCpuBuckets(
+        size_t maxRecords, uint64_t* safeWatermarkMs, uint64_t expectedGeneration) {
+    std::lock_guard<std::mutex> guard(gObservatoryMutex);
+    if (safeWatermarkMs != nullptr) *safeWatermarkMs = 0;
+    // Checked under the same lock start and stop take, so a session cannot turn over between the
+    // caller reading the generation and this drain destructively emptying the map.
+    if (expectedGeneration != 0 && expectedGeneration != gObservatorySessionGeneration) return {};
+    if (!initObservatoryMapsLocked()) return {};
+
+    const uint32_t zero = 0;
+    uint64_t totalBeforeScan;
+    if (findMapEntry(gObservatoryTotalNewEntriesMapFd, &zero, &totalBeforeScan) != 0) return {};
+
+    struct timespec bootTime = {};
+    if (clock_gettime(CLOCK_BOOTTIME, &bootTime) != 0) return {};
+    const uint64_t nowBootNs = static_cast<uint64_t>(bootTime.tv_sec) * 1000000000ULL +
+            static_cast<uint64_t>(bootTime.tv_nsec);
+    const uint64_t currentBucket = nowBootNs / OBSERVATORY_CPU_BUCKET_NS;
+
+    // An LRU map restarts iteration from the first element once the previous key is evicted, so a
+    // map churning under load hands back keys forever. The next drain picks up what this missed.
+    std::vector<observatory_cpu_bucket_key_t> completedKeys;
+    std::set<std::pair<uint64_t, uint32_t>> seenKeys;
+    bool scanComplete = false;
+    observatory_cpu_bucket_key_t key;
+    if (getFirstMapKey(gObservatoryBucketMapFd, &key) == 0) {
+        for (size_t visited = 0; visited < kObservatoryMaxScanSteps; visited++) {
+            if (seenKeys.emplace(key.bucket, key.uid).second && key.bucket < currentBucket) {
+                completedKeys.push_back(key);
+            }
+            observatory_cpu_bucket_key_t previousKey = key;
+            if (getNextMapKey(gObservatoryBucketMapFd, &previousKey, &key) != 0) {
+                if (errno != ENOENT) return {};
+                scanComplete = true;
+                break;
+            }
+        }
+    } else if (errno == ENOENT) {
+        scanComplete = true;
+    } else {
+        return {};
+    }
+    // A truncated scan saw only part of the map, so occupancy is assumed full rather than
+    // understated. Overestimating trips pressure early, understating risks silent LRU eviction.
+    const size_t residentEntryCount =
+            scanComplete ? seenKeys.size() : size_t{OBSERVATORY_CPU_MAX_BUCKETS};
+
+    std::sort(completedKeys.begin(), completedKeys.end(),
+              [](const auto &left, const auto &right) {
+                  if (left.bucket != right.bucket) return left.bucket < right.bucket;
+                  return left.uid < right.uid;
+              });
+    if (completedKeys.size() > maxRecords) completedKeys.resize(maxRecords);
+
+    std::vector<uid_cpu_bucket_t> result;
+    result.reserve(completedKeys.size());
+    for (const auto &completedKey : completedKeys) {
+        uint64_t runtimeNs;
+        // Lookup-and-delete prevents a concurrent scheduler update from landing between the two
+        // operations and then being discarded.
+        if (findAndDeleteMapEntry(gObservatoryBucketMapFd, &completedKey, &runtimeNs) != 0) {
+            if (errno == ENOENT) continue;
+            return {};
+        }
+        result.push_back({
+                .uid = completedKey.uid,
+                .start_elapsed_realtime_ms =
+                        completedKey.bucket * (OBSERVATORY_CPU_BUCKET_NS / 1000000ULL),
+                .runtime_ns = runtimeNs,
+        });
+    }
+
+    uint64_t totalAfterDrain;
+    if (findMapEntry(gObservatoryTotalNewEntriesMapFd, &zero, &totalAfterDrain) != 0) return {};
+    // The scan and deletes race with scheduler insertions. Counting all insertions observed during
+    // that window again can only overestimate occupancy, which causes an early pressure callback
+    // rather than risking LRU eviction before the callback.
+    const uint64_t entriesLeftFromScan =
+            residentEntryCount > result.size() ? residentEntryCount - result.size() : 0;
+    const uint64_t insertedDuringDrain =
+            totalAfterDrain >= totalBeforeScan ? totalAfterDrain - totalBeforeScan : 0;
+    const uint64_t estimatedResidentEntries = entriesLeftFromScan + insertedDuringDrain;
+    if (!rearmObservatoryCpuPressureLocked(totalAfterDrain, estimatedResidentEntries)) return {};
+
+    // Read as a monotonic total and differenced here. Clearing it would need a read followed by a
+    // write, which silently discards anything the program added in between.
+    uint64_t droppedRuntimeNs;
+    if (gObservatoryDroppedRuntimeMapFd >= 0 &&
+        findMapEntry(gObservatoryDroppedRuntimeMapFd, &zero, &droppedRuntimeNs) == 0 &&
+        droppedRuntimeNs > gObservatoryReportedDroppedRuntimeNs) {
+        ALOGW("Dropped %" PRIu64 " ns of Observatory CPU runtime from over-long slices",
+              droppedRuntimeNs - gObservatoryReportedDroppedRuntimeNs);
+        gObservatoryReportedDroppedRuntimeNs = droppedRuntimeNs;
+    }
+
+    // Keys are sorted before the maxRecords cut, so whatever a complete scan leaves behind is
+    // newer than the last bucket it returned. A truncated scan saw an arbitrary subset instead,
+    // and however new its buckets look, older keys it never visited may still be resident.
+    if (safeWatermarkMs != nullptr && scanComplete && !result.empty()) {
+        *safeWatermarkMs = result.back().start_elapsed_realtime_ms;
+    }
+    return result;
 }
 
 } // namespace bpf
