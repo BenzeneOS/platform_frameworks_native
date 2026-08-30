@@ -200,6 +200,10 @@ ssize_t AidlSensorHalWrapper::pollFmq(sensors_event_t *buffer, size_t maxNumEven
 
     size_t eventsToRead = std::min({availableEvents, maxNumEventsToRead, mEventBuffer.size()});
     if (eventsToRead > 0) {
+        // A read that fills fewer bytes per slot than the slot holds leaves the tail of each
+        // entry carrying the previous poll's contents, which convertToSensorEvent then reads
+        // through a type-tagged union.
+        memset(mEventBuffer.data(), 0, eventsToRead * sizeof(mEventBuffer[0]));
         if (mEventQueue->read(mEventBuffer.data(), eventsToRead)) {
             // Notify the Sensors HAL that sensor events have been read. This is required to support
             // the use of writeBlocking by the Sensors HAL.
